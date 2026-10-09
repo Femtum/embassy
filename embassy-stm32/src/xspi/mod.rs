@@ -83,6 +83,53 @@ impl Default for Config {
     }
 }
 
+/// XSPI I/O manager (XSPIM) premapping.
+///
+/// The XSPIM maps the two XSPI controllers onto the two I/O ports. In the
+/// multiplexed variants both controllers drive the same port and are
+/// time-multiplexed by the arbiter, which is required for two controllers to
+/// drive a single external memory (for example read-while-write).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum XspimMux {
+    /// XSPI1 -> Port 1, XSPI2 -> Port 2 (reset default).
+    Direct,
+    /// XSPI1 -> Port 2, XSPI2 -> Port 1.
+    Swapped,
+    /// XSPI1 and XSPI2 both mapped to Port 1, arbitrated.
+    MultiplexedPort1,
+    /// XSPI1 and XSPI2 both mapped to Port 2, arbitrated.
+    MultiplexedPort2,
+}
+
+/// XSPI I/O manager (XSPIM) configuration.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct XspimConfig {
+    /// How the XSPI controllers are mapped onto the I/O ports.
+    pub mux: XspimMux,
+    /// Minimum number of clock cycles between the active XSPI releasing the
+    /// shared bus (falling REQ) and granting it to the other (rising ACK).
+    pub req2ack_time: u8,
+    /// NCS output targeted by both controllers in multiplexed mode
+    /// (`0` = NCS1, `1` = NCS2). Ignored for the direct/swapped mappings.
+    pub ncs: u8,
+}
+
+/// How the XSPI/XSPIM is brought up during driver construction.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum XspimInit {
+    /// Single controller using the reset/default mapping.
+    Default,
+    /// First controller on a shared port: configures the port pins and XSPIM.
+    #[cfg(xspim_v1)]
+    Owner(XspimConfig),
+    /// Second controller on the same port: configures only its own registers.
+    #[cfg(xspim_v1)]
+    Secondary(XspimConfig),
+}
+
 /// XSPI transfer configuration.
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -304,6 +351,7 @@ impl<'d, T: Instance, M: PeriMode> Xspi<'d, T, M> {
         self.config.clock_prescaler = prescaler;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_inner(
         peri: Peri<'d, T>,
         _d0: Option<Flex<'d>>,
@@ -333,6 +381,77 @@ impl<'d, T: Instance, M: PeriMode> Xspi<'d, T, M> {
         width: XspiWidth,
         dual_quad: bool,
     ) -> Self {
+        Self::new_inner_ex(
+            peri,
+            _d0,
+            _d1,
+            _d2,
+            _d3,
+            _d4,
+            _d5,
+            _d6,
+            _d7,
+            _d8,
+            _d9,
+            _d10,
+            _d11,
+            _d12,
+            _d13,
+            _d14,
+            _d15,
+            _clk,
+            ncs_cssel,
+            _ncs,
+            _ncs_alt,
+            _dqs0,
+            _dqs1,
+            dma,
+            config,
+            width,
+            dual_quad,
+            XspimInit::Default,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner_ex(
+        peri: Peri<'d, T>,
+        _d0: Option<Flex<'d>>,
+        _d1: Option<Flex<'d>>,
+        _d2: Option<Flex<'d>>,
+        _d3: Option<Flex<'d>>,
+        _d4: Option<Flex<'d>>,
+        _d5: Option<Flex<'d>>,
+        _d6: Option<Flex<'d>>,
+        _d7: Option<Flex<'d>>,
+        _d8: Option<Flex<'d>>,
+        _d9: Option<Flex<'d>>,
+        _d10: Option<Flex<'d>>,
+        _d11: Option<Flex<'d>>,
+        _d12: Option<Flex<'d>>,
+        _d13: Option<Flex<'d>>,
+        _d14: Option<Flex<'d>>,
+        _d15: Option<Flex<'d>>,
+        _clk: Option<Flex<'d>>,
+        ncs_cssel: u8,
+        _ncs: Option<Flex<'d>>,
+        _ncs_alt: Option<Flex<'d>>,
+        _dqs0: Option<Flex<'d>>,
+        _dqs1: Option<Flex<'d>>,
+        dma: Option<ChannelAndRequest<'d>>,
+        config: Config,
+        width: XspiWidth,
+        dual_quad: bool,
+        xspim: XspimInit,
+    ) -> Self {
+        // In multiplexed mode the NCS targeting is dictated by the shared
+        // XSPIM configuration, so the owner must use it for its own CSSEL too.
+        let effective_ncs = match xspim {
+            #[cfg(xspim_v1)]
+            XspimInit::Owner(cfg) => cfg.ncs,
+            _ => ncs_cssel,
+        };
+
         // Enable the interface (H7RS only - N6 doesn't have PWR XSPIM enable bits)
         #[cfg(pwr_h7rs)]
         match T::SPI_IDX {
@@ -360,21 +479,50 @@ impl<'d, T: Instance, M: PeriMode> Xspi<'d, T, M> {
             });
 
             // Configure XSPI IO Manager
-            // Note: ncs_cssel indicates which NCS pin is being used (0=NCS0, 1=NCS1)
-            T::SPIM_REGS.cr().modify(|w| {
-                w.set_muxen(false);
-                w.set_req2ack_time(1); // Match ST HAL (was 0xff, which is only relevant when muxen=true)
-                // H7RS and N6: Enable chip select override (required for proper NCS routing)
-                #[cfg(any(stm32h7rs, stm32n6))]
-                w.set_cssel_ovr_en(true);
-                // Set override value based on pin configuration (0=NCS0, 1=NCS1)
-                // Each XSPI has its own override field in XSPIM
-                match T::SPI_IDX {
-                    1 => w.set_cssel_ovr_o1(ncs_cssel != 0),
-                    2 => w.set_cssel_ovr_o2(ncs_cssel != 0),
-                    _ => {} // XSPI3 not supported in non-multiplexed mode
+            match xspim {
+                // Second controller on a shared port: the port pins and the
+                // XSPIM premapping are owned by the other controller, so only
+                // this controller's own registers are configured below.
+                XspimInit::Secondary(_) => {}
+                // First controller on a mapped/shared port: configure the
+                // premapping. In multiplexed mode both controllers must target
+                // the same NCS, hence both override fields are set here.
+                XspimInit::Owner(cfg) => {
+                    let (muxen, mode) = match cfg.mux {
+                        XspimMux::Direct => (false, false),
+                        XspimMux::Swapped => (false, true),
+                        XspimMux::MultiplexedPort1 => (true, false),
+                        XspimMux::MultiplexedPort2 => (true, true),
+                    };
+                    T::SPIM_REGS.cr().modify(|w| {
+                        w.set_muxen(muxen);
+                        w.set_mode(mode);
+                        w.set_req2ack_time(cfg.req2ack_time);
+                        // H7RS and N6: enable chip select override (required for proper NCS routing)
+                        #[cfg(any(stm32h7rs, stm32n6))]
+                        w.set_cssel_ovr_en(true);
+                        w.set_cssel_ovr_o1(cfg.ncs != 0);
+                        w.set_cssel_ovr_o2(cfg.ncs != 0);
+                    });
                 }
-            });
+                // Default single-controller behavior.
+                XspimInit::Default => {
+                    T::SPIM_REGS.cr().modify(|w| {
+                        w.set_muxen(false);
+                        w.set_req2ack_time(1); // Match ST HAL (was 0xff, which is only relevant when muxen=true)
+                        // H7RS and N6: Enable chip select override (required for proper NCS routing)
+                        #[cfg(any(stm32h7rs, stm32n6))]
+                        w.set_cssel_ovr_en(true);
+                        // Set override value based on pin configuration (0=NCS0, 1=NCS1)
+                        // Each XSPI has its own override field in XSPIM
+                        match T::SPI_IDX {
+                            1 => w.set_cssel_ovr_o1(ncs_cssel != 0),
+                            2 => w.set_cssel_ovr_o2(ncs_cssel != 0),
+                            _ => {} // XSPI3 not supported in non-multiplexed mode
+                        }
+                    });
+                }
+            }
             debug!("XSPI init: XSPIM configured");
 
             // H7RS: Enable XSPI clock after initial config (original sequence)
@@ -430,7 +578,7 @@ impl<'d, T: Instance, M: PeriMode> Xspi<'d, T, M> {
             w.set_dmm(dual_quad);
 
             assert!(_ncs_alt.is_none(), "ncs_alt TODO");
-            let cssel = if ncs_cssel == 0 { Cssel::B0x0 } else { Cssel::B0x1 };
+            let cssel = if effective_ncs == 0 { Cssel::B0x0 } else { Cssel::B0x1 };
             w.set_cssel(cssel);
         });
 
@@ -1051,6 +1199,69 @@ impl<'d, T: Instance> Xspi<'d, T, Blocking> {
         )
     }
 
+    /// Create a blocking XSPI driver for octo-spi with DQS pin support that
+    /// also owns and configures the shared XSPI I/O manager (XSPIM).
+    ///
+    /// Use this for the controller connected to the physical pins when two
+    /// controllers share a single external memory (see [`XspimMux`]). The
+    /// second controller is created with `new_xspi_secondary`.
+    ///
+    /// All XSPI controllers must be disabled while the XSPIM premapping is
+    /// written (see the reference manual's XSPIM matrix section), so bring both
+    /// controllers up before enabling memory-mapped mode.
+    #[cfg(xspim_v1)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_blocking_xspi_dqs_xspim(
+        peri: Peri<'d, T>,
+        clk: Peri<'d, impl CLKPin<T>>,
+        d0: Peri<'d, impl D0Pin<T>>,
+        d1: Peri<'d, impl D1Pin<T>>,
+        d2: Peri<'d, impl D2Pin<T>>,
+        d3: Peri<'d, impl D3Pin<T>>,
+        d4: Peri<'d, impl D4Pin<T>>,
+        d5: Peri<'d, impl D5Pin<T>>,
+        d6: Peri<'d, impl D6Pin<T>>,
+        d7: Peri<'d, impl D7Pin<T>>,
+        ncs: Peri<'d, impl NCSEither<T>>,
+        dqs0: Peri<'d, impl DQS0Pin<T>>,
+        config: Config,
+        xspim: XspimConfig,
+    ) -> Self {
+        Self::new_inner_ex(
+            peri,
+            new_pin!(d0, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(d1, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(d2, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(d3, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(d4, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(d5, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(d6, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(d7, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            new_pin!(clk, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            ncs.sel(),
+            new_pin!(
+                ncs,
+                AfType::output_pull(OutputType::PushPull, Speed::VeryHigh, Pull::Up)
+            ),
+            None,
+            new_pin!(dqs0, AfType::input(Pull::None)),
+            None,
+            None,
+            config,
+            XspiWidth::OCTO,
+            false,
+            XspimInit::Owner(xspim),
+        )
+    }
+
     /// Create new blocking XSPI driver for 16-bit hexadeca-spi external chips
     pub fn new_blocking_xspi_hexa(
         peri: Peri<'d, T>,
@@ -1523,6 +1734,60 @@ impl<'d, T: Instance> Xspi<'d, T, Async> {
             config,
             XspiWidth::OCTO,
             false,
+        )
+    }
+
+    /// Create an async XSPI driver for a controller that shares its physical
+    /// port with another controller.
+    ///
+    /// This configures only the controller's own registers: no pins are
+    /// consumed and the XSPIM premapping is left untouched, because it is
+    /// owned by the other controller (created with a matching [`XspimConfig`]
+    /// via `new_blocking_xspi_dqs_xspim`). It is intended for the
+    /// second controller in a multiplexed setup, for example the indirect-write
+    /// controller in a read-while-write scheme.
+    #[cfg(xspim_v1)]
+    pub fn new_xspi_secondary<D: XDma<T>>(
+        peri: Peri<'d, T>,
+        dma: Peri<'d, D>,
+        _irq: impl crate::interrupt::typelevel::Binding<D::Interrupt, crate::dma::InterruptHandler<D>> + 'd,
+        config: Config,
+        xspim: XspimConfig,
+    ) -> Self {
+        assert!(
+            matches!(xspim.mux, XspimMux::MultiplexedPort1 | XspimMux::MultiplexedPort2),
+            "a secondary XSPI requires a multiplexed XSPIM mapping"
+        );
+
+        Self::new_inner_ex(
+            peri,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            xspim.ncs,
+            None,
+            None,
+            None,
+            None,
+            new_dma!(dma, _irq),
+            config,
+            XspiWidth::OCTO,
+            false,
+            XspimInit::Secondary(xspim),
         )
     }
 
