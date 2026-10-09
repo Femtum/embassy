@@ -1288,6 +1288,52 @@ impl<'d, T: Instance> Xspi<'d, T, Blocking> {
         )
     }
 
+    /// Create a blocking XSPI driver for a controller that shares its physical
+    /// port with another controller.
+    ///
+    /// This configures only the controller's own registers: no pins are
+    /// consumed and the XSPIM premapping is left untouched, because it is owned
+    /// by the other controller. It is intended for the second controller in a
+    /// multiplexed setup.
+    #[cfg(xspim_v1)]
+    pub fn new_blocking_xspi_secondary(peri: Peri<'d, T>, config: Config, xspim: XspimConfig) -> Self {
+        assert!(
+            matches!(xspim.mux, XspimMux::MultiplexedPort1 | XspimMux::MultiplexedPort2),
+            "a secondary XSPI requires a multiplexed XSPIM mapping"
+        );
+
+        Self::new_inner_ex(
+            peri,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            xspim.ncs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            config,
+            XspiWidth::OCTO,
+            false,
+            XspimInit::Secondary(xspim),
+        )
+    }
+
     /// Create new blocking XSPI driver for 16-bit hexadeca-spi external chips
     pub fn new_blocking_xspi_hexa(
         peri: Peri<'d, T>,
