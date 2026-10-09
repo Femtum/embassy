@@ -245,6 +245,8 @@ pub struct Xspi<'d, T: Instance, M: PeriMode> {
     _marker: PhantomData<M>,
     config: Config,
     width: XspiWidth,
+    /// Memory-mapped prefetch timeout (`FLASH_LPTR.TIMEOUT`), if enabled.
+    mm_timeout: Option<u16>,
 }
 
 impl<'d, T: Instance, M: PeriMode> Xspi<'d, T, M> {
@@ -304,9 +306,32 @@ impl<'d, T: Instance, M: PeriMode> Xspi<'d, T, M> {
         // Enable memory mapped mode
         reg.cr().modify(|r| {
             r.set_fmode(Fmode::B0x3);
-            r.set_tcen(false);
+            r.set_tcen(self.mm_timeout.is_some());
         });
+        if let Some(timeout) = self.mm_timeout {
+            reg.lptr().modify(|w| w.set_timeout(timeout));
+        }
         Ok(())
+    }
+
+    /// Configure the memory-mapped prefetch timeout.
+    ///
+    /// With a timeout set, the controller releases NCS after `timeout` XSPI
+    /// clock cycles without an access, once the clock has gone inactive. This
+    /// is needed when the port is shared with another controller through a
+    /// multiplexed XSPIM (see [`XspimMux`]): otherwise the memory-mapped
+    /// controller's prefetch keeps NCS asserted and starves the other
+    /// controller.
+    ///
+    /// Pass `None` to disable the timeout (the reset default). The setting is
+    /// applied immediately and re-applied whenever memory-mapped mode is
+    /// entered.
+    pub fn set_memory_mapped_timeout(&mut self, timeout: Option<u16>) {
+        self.mm_timeout = timeout;
+        T::REGS.cr().modify(|w| w.set_tcen(timeout.is_some()));
+        if let Some(timeout) = timeout {
+            T::REGS.lptr().modify(|w| w.set_timeout(timeout));
+        }
     }
 
     /// Quit from memory mapped mode
@@ -627,6 +652,7 @@ impl<'d, T: Instance, M: PeriMode> Xspi<'d, T, M> {
             _marker: PhantomData,
             config,
             width,
+            mm_timeout: None,
         }
     }
 
